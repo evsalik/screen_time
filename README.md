@@ -1,5 +1,7 @@
 # Screen Time Tracker
 
+_Disclaimer: This project is intended for personal use to help monitor screen time. It does not collect or transmit any personal data._
+
 A lightweight Windows application that tracks the active time you spend on different applications. It provides a visual representation of your usage, helping you monitor and manage your screen time effectively.
 
 ![Screenshot of Screen Time Tracker](screenshot.png)
