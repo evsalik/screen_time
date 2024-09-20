@@ -9,6 +9,8 @@
 *.obj
 *.o
 
+*.dll
+
 # Ignore logs
 *.log
 ScreenTimeLog.txt

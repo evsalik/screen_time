@@ -7,7 +7,6 @@
 #include <map>
 #include <string>
 #include <sstream>
-#include <cstdio>
 
 std::mutex dataMutex;
 std::map<std::string, std::chrono::seconds> appActiveTime;
@@ -74,14 +73,4 @@ std::pair<std::string, std::string> GetAppNameAndPathFromWindow(HWND hwnd) {
         CloseHandle(hProcess);
     }
     return { "Unknown", "" };
-}
-
-std::string FormatDuration(std::chrono::seconds duration) {
-    int totalSeconds = static_cast<int>(duration.count());
-    int hours = totalSeconds / 3600;
-    int minutes = (totalSeconds % 3600) / 60;
-    int seconds = totalSeconds % 60;
-    char buffer[20];
-    std::snprintf(buffer, sizeof(buffer), "%dh:%dm:%ds", hours, minutes, seconds);
-    return std::string(buffer);
 }
