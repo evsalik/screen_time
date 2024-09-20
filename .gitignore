@@ -1,0 +1,14 @@
+# Ignore build directories
+/cmake-build-*/
+
+# Ignore CLion configuration files
+.idea/
+
+# Ignore Windows executables and object files
+*.exe
+*.obj
+*.o
+
+# Ignore logs
+*.log
+ScreenTimeLog.txt
