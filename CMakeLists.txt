@@ -16,12 +16,5 @@ target_link_libraries(screen_time
         Psapi
         Gdi32
         Gdiplus
+        Dwmapi
 )
-
-# Comment out or remove the subsystem linker flags
-# Set the subsystem linker flag based on the compiler
-# if (MINGW)
-#     set_target_properties(screen_time PROPERTIES LINK_FLAGS "-Wl,-subsystem,windows")
-# else()
-#     set_target_properties(screen_time PROPERTIES LINK_FLAGS "/SUBSYSTEM:WINDOWS")
-# endif()

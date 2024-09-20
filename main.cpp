@@ -4,7 +4,6 @@
 #include <gdiplus.h>
 #pragma comment(lib, "Gdiplus.lib")
 
-// Global variables
 HINSTANCE hInst;
 HWND hWnd;
 ULONG_PTR gdiplusToken;

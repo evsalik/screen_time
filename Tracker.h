@@ -19,4 +19,4 @@ std::pair<std::string, std::string> GetAppNameAndPathFromWindow(HWND hwnd);
 void StartTrackingThread();
 std::string FormatDuration(std::chrono::seconds duration);
 
-#endif // TRACKER_H
+#endif

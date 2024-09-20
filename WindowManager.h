@@ -7,4 +7,4 @@ void RegisterMainWindowClass(HINSTANCE hInstance);
 HWND CreateMainWindow(HINSTANCE hInstance);
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
-#endif // WINDOW_MANAGER_H
+#endif

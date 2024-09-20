@@ -4,12 +4,29 @@
 #include <gdiplus.h>
 #include <mutex>
 #include <string>
-#include <sstream>
 #include <shellapi.h>
 #include <map>
 #include <vector>
 #include <algorithm>
 #include "Resource.h"
+#include <dwmapi.h>
+#pragma comment(lib, "Dwmapi.lib")
+#pragma comment(lib, "Shcore.lib")
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+
+enum DWM_WINDOW_CORNER_PREFERENCE {
+    DWMWCP_DEFAULT       = 0,
+    DWMWCP_DONOTROUND    = 1,
+    DWMWCP_ROUND         = 2,
+    DWMWCP_ROUNDSMALL    = 3
+};
 
 using namespace Gdiplus;
 
@@ -20,6 +37,10 @@ extern bool isPaused;
 extern std::mutex dataMutex;
 extern std::map<std::string, std::chrono::seconds> appActiveTime;
 extern std::map<std::string, std::string> appPaths;
+
+// DPI scaling factors
+float dpiScaleX = 1.0f;
+float dpiScaleY = 1.0f;
 
 void RegisterMainWindowClass(HINSTANCE hInstance) {
     WNDCLASS wc = {};
@@ -47,8 +68,8 @@ HWND CreateMainWindow(HINSTANCE hInstance) {
     // Get screen dimensions
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    int windowWidth = 400; // Smaller width
-    int windowHeight = 300; // Smaller height
+    int windowWidth = 400;
+    int windowHeight = 300;
 
     // Calculate window position to center it
     int xPos = (screenWidth - windowWidth) / 2;
@@ -57,14 +78,15 @@ HWND CreateMainWindow(HINSTANCE hInstance) {
     HWND hwnd = CreateWindowEx(
             0,
             "ScreenTimeTrackerWindowClass",
-            NULL, // No window title
-            WS_POPUP, // Borderless window
+            "Screen Time Tracker", // Window title
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, // Window with title bar and minimize button
             xPos, yPos, windowWidth, windowHeight,
             NULL,
             NULL,
             hInstance,
             NULL
     );
+
     ShowWindow(hwnd, SW_SHOW);
     return hwnd;
 }
@@ -73,6 +95,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     static NOTIFYICONDATA nid = {};
     switch (uMsg) {
         case WM_CREATE: {
+            // Get the DPI scaling factor using GetDeviceCaps
+            HDC screen = GetDC(hwnd);
+            int dpiX = GetDeviceCaps(screen, LOGPIXELSX);
+            int dpiY = GetDeviceCaps(screen, LOGPIXELSY);
+            ReleaseDC(hwnd, screen);
+
+            dpiScaleX = dpiX / 96.0f;
+            dpiScaleY = dpiY / 96.0f;
+
+            BOOL useDarkMode = TRUE;
+            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
+
+            // Set window corner preference to rounded (Windows 11)
+            DWM_WINDOW_CORNER_PREFERENCE cornerPreference = DWMWCP_ROUND;
+            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cornerPreference, sizeof(cornerPreference));
+
             nid.cbSize = sizeof(NOTIFYICONDATA);
             nid.hWnd = hwnd;
             nid.uID = 1001;
@@ -89,7 +127,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_ERASEBKGND:
             return 1; // Prevent background erasure to reduce flickering
         case WM_LBUTTONDOWN:
-            // Enable window dragging
             ReleaseCapture();
             SendMessage(hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0);
             break;
@@ -97,7 +134,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
 
-            // Create an off-screen buffer
             Bitmap bufferBitmap(ps.rcPaint.right, ps.rcPaint.bottom);
             Graphics bufferGraphics(&bufferBitmap);
 
@@ -124,18 +160,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 return a.second > b.second;
             });
 
-            // Drawing variables
-            int x = 10, y = 10;
-            int iconSize = 24;
-            int yIncrement = iconSize + 15; // Increased vertical spacing
-            int barHeight = 8; // Thinner bars
+
+            int x = static_cast<int>(10 * dpiScaleX);
+            int y = static_cast<int>(10 * dpiScaleY);
+            int iconSize = static_cast<int>(24 * dpiScaleX);
+            int yIncrement = iconSize + static_cast<int>(15 * dpiScaleY);
+            int barHeight = static_cast<int>(8 * dpiScaleY);
             std::chrono::seconds totalTime(0);
             for (const auto& entry : appActiveTime)
                 totalTime += entry.second;
             if (totalTime.count() == 0)
                 totalTime = std::chrono::seconds(1);
 
-            Font font(L"Segoe UI", 10); // Increased font size
+            Font font(L"Segoe UI", static_cast<REAL>(10 * dpiScaleY)); // Adjust font size
 
             for (const auto& entry : apps) {
                 std::string appName = entry.first;
@@ -149,22 +186,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     hIcon = LoadIcon(NULL, IDI_APPLICATION);
                 }
 
-                // Create Bitmap from HICON
                 Bitmap* pIconBitmap = Bitmap::FromHICON(hIcon);
 
                 // Adjust positions
                 int iconX = x;
-                int iconY = y + 15;
-                int textX = x + iconSize + 5;
-                int appNameY = y + 3;
+                int iconY = y + static_cast<int>(15 * dpiScaleY);
+                int textX = x + iconSize + static_cast<int>(5 * dpiScaleX);
+                int appNameY = y + static_cast<int>(3 * dpiScaleY);
                 int barX = textX;
-                int barY = y + iconSize + 1; // Position the bar below the icon
-                int timeY = barY - 6;
+                int barY = y + iconSize + static_cast<int>(1 * dpiScaleY);
+                int timeY = barY - static_cast<int>(6 * dpiScaleY);
 
                 // Draw the icon
                 if (pIconBitmap) {
-                    // Draw the icon at its native size
-                    bufferGraphics.DrawImage(pIconBitmap, iconX, iconY);
+                    // Draw the icon at desired size
+                    bufferGraphics.DrawImage(pIconBitmap, Rect(iconX, iconY, iconSize, iconSize));
                     delete pIconBitmap;
                 }
 
@@ -174,21 +210,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 // Draw the app name
                 std::wstring wAppName(appName.begin(), appName.end());
                 bufferGraphics.DrawString(wAppName.c_str(), -1, &font,
-                                          PointF(static_cast<Gdiplus::REAL>(textX), static_cast<Gdiplus::REAL>(appNameY)), &textBrush);
+                                          PointF(static_cast<REAL>(textX), static_cast<REAL>(appNameY)), &textBrush);
 
                 // Draw the bar
                 double percentage = static_cast<double>(appTime.count()) / totalTime.count();
-                int barMaxWidth = ps.rcPaint.right - barX - 20;
+                int barMaxWidth = ps.rcPaint.right - barX - static_cast<int>(20 * dpiScaleX) - 100;
                 int barWidth = static_cast<int>(percentage * barMaxWidth);
                 Rect barRect(barX, barY, barWidth, barHeight);
-                int cornerRadius = 5; // Adjust as needed
+                int cornerRadius = static_cast<int>(5 * dpiScaleX); // Adjust as needed
                 DrawRoundedRectangle(bufferGraphics, barBrush, barRect, cornerRadius);
 
                 // Draw the time label aligned with the bar
                 std::string timeStr = FormatDuration(appTime);
                 std::wstring wTimeStr(timeStr.begin(), timeStr.end());
                 bufferGraphics.DrawString(wTimeStr.c_str(), -1, &font,
-                                          PointF(static_cast<Gdiplus::REAL>(barX + barWidth + 5), static_cast<Gdiplus::REAL>(timeY)), &textBrush);
+                                          PointF(static_cast<REAL>(barX + barWidth + static_cast<int>(5 * dpiScaleX)),
+                                                 static_cast<REAL>(timeY)), &textBrush);
 
                 // Move to the next item
                 y += yIncrement;
