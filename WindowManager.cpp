@@ -1,8 +1,7 @@
-// WindowManager.cpp
 #include <windows.h>
-#include <windowsx.h> // Added to define GET_X_LPARAM and GET_Y_LPARAM
+#include <windowsx.h>
 #include "WindowManager.h"
-#include "FormatUtils.h" // For FormatDuration
+#include "FormatUtils.h"
 #include <gdiplus.h>
 #include <mutex>
 #include <string>
@@ -12,9 +11,11 @@
 #include <algorithm>
 #include "Resource.h"
 #include <dwmapi.h>
-#include <chrono> // Added for std::chrono::seconds
+#include <chrono>
 #include <cstdio>
-#include <assert.h>
+#include <fstream>
+#include <iostream>
+#include "json.hpp"
 #pragma comment(lib, "Dwmapi.lib")
 #pragma comment(lib, "Shcore.lib")
 
@@ -24,6 +25,11 @@
 
 #ifndef DWMWA_WINDOW_CORNER_PREFERENCE
 #define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#define IDC_CLEAR_BUTTON      1001
+#define IDC_BUTTON_TODAY      1002
+#define IDC_BUTTON_3DAYS      1003
+#define IDC_BUTTON_WEEK       1004
+#define IDC_BUTTON_MONTH      1005
 #endif
 
 enum DWM_WINDOW_CORNER_PREFERENCE {
@@ -33,7 +39,11 @@ enum DWM_WINDOW_CORNER_PREFERENCE {
     DWMWCP_ROUNDSMALL    = 3
 };
 
+enum TimeRange { TODAY, LAST_3_DAYS, LAST_WEEK, LAST_MONTH };
+TimeRange selectedTimeRange = TODAY;
+
 using namespace Gdiplus;
+using json = nlohmann::json;
 
 extern HINSTANCE hInst;
 extern HWND hWnd;
@@ -42,26 +52,103 @@ extern bool isPaused;
 extern std::mutex dataMutex;
 extern std::map<std::string, std::chrono::seconds> appActiveTime;
 extern std::map<std::string, std::string> appPaths;
+std::map<std::string, std::chrono::system_clock::time_point> appStartTime;
+extern std::string currentAppName;
 
-// Scroll parameters
-int scrollPos = 0;          // Current scroll position
-int scrollMax = 0;          // Maximum scroll position
-const int scrollStep = 20;  // Amount to scroll on each step
+int scrollPos = 0;
+int scrollMax = 0;
+const int scrollStep = 10;
 
-// DPI scaling factors
 float dpiScaleX = 1.0f;
 float dpiScaleY = 1.0f;
 
-// Custom Scroll Bar Parameters
+int windowWidth = 400;
+int windowHeight = 400;
+
 const int SCROLL_BAR_WIDTH = static_cast<int>(15 * dpiScaleX);
-const Color SCROLL_BAR_BACKGROUND_COLOR(30, 30, 30); // Dark gray background
-const Color SCROLL_BAR_THUMB_COLOR(80, 80, 80);      // Lighter gray thumb
-const int THUMB_HEIGHT = 50; // Example thumb height
+const int MIN_BAR_WIDTH = 5;
+
+const Color DARK_SCROLL_BAR_BACKGROUND_COLOR(25, 25, 25);
+const Color DARK_SCROLL_BAR_THUMB_COLOR(50, 50, 50);
+const Color LESS_AGGRESSIVE_GRADIENT_START(150, 150, 150, 150);
+const Color LESS_AGGRESSIVE_GRADIENT_END(90, 90, 90, 90);
+
+const Color HIGHLIGHT_COLOR(80, 80, 80);
+
+const int THUMB_HEIGHT = 50;
 
 // Variables to track scroll thumb dragging
 bool isDraggingThumb = false;
 POINT dragStartPoint;
 int initialScrollPos = 0;
+
+// Animation state
+std::map<std::string, int> currentBarWidths;
+
+std::chrono::system_clock::time_point GetStartTimeForRange(TimeRange range) {
+    auto now = std::chrono::system_clock::now();
+    switch (range) {
+        case TODAY:
+            return now - std::chrono::hours(24);
+        case LAST_3_DAYS:
+            return now - std::chrono::hours(72);
+        case LAST_WEEK:
+            return now - std::chrono::hours(24 * 7);
+        case LAST_MONTH:
+            return now - std::chrono::hours(24 * 30);
+        default:
+            return now; // Should never happen
+    }
+}
+
+void SaveTrackingDataToFile(const std::string& filename) {
+    json j;
+    {
+        std::lock_guard<std::mutex> lock(dataMutex); // Lock the dataMutex within a scoped block
+
+        for (const auto& [appName, timeSpent] : appActiveTime) {
+            j["app_data"][appName]["time_in_seconds"] = timeSpent.count();
+            j["app_data"][appName]["app_path"] = appPaths[appName];
+
+            // Convert the start time to a string
+            std::time_t startTime = std::chrono::system_clock::to_time_t(appStartTime[appName]);
+            j["app_data"][appName]["start_time"] = std::ctime(&startTime);
+        }
+    } // Mutex is released here
+
+    std::ofstream file(filename);
+    if (file.is_open()) {
+        file << j.dump(4);
+        file.close();
+    }
+}
+
+void LoadTrackingDataFromFile(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        return; // If the file doesn't exist, skip loading
+    }
+
+    json j;
+    file >> j;
+    file.close();
+
+    std::lock_guard<std::mutex> lock(dataMutex);
+
+    for (auto& [appName, data] : j["app_data"].items()) {
+        std::chrono::seconds timeSpent(data["time_in_seconds"].get<int>());
+        appActiveTime[appName] = timeSpent;
+        appPaths[appName] = data["app_path"].get<std::string>();
+
+        // Parse the start time
+        std::string startTimeStr = data["start_time"].get<std::string>();
+        std::tm tm = {};
+        std::istringstream ss(startTimeStr);
+        ss >> std::get_time(&tm, "%a %b %d %H:%M:%S %Y");
+        auto startTime = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+        appStartTime[appName] = startTime;
+    }
+}
 
 void RegisterMainWindowClass(HINSTANCE hInstance) {
     WNDCLASS wc = {};
@@ -85,22 +172,35 @@ void DrawRoundedRectangle(Graphics& graphics, Brush& brush, Rect rect, int radiu
     graphics.FillPath(&brush, &path);
 }
 
+// Linear interpolation function
+float Lerp(float start, float end, float t) {
+    return start + t * (end - start);
+}
+
+void UpdateBarWidth(const std::string& appName, int targetWidth) {
+    const float animationSpeed = 0.1f;
+    if (currentBarWidths.find(appName) == currentBarWidths.end()) {
+        currentBarWidths[appName] = targetWidth; // Initialize if not present
+    }
+
+    // LERP towards the target width for smooth transitions
+    currentBarWidths[appName] = static_cast<int>(
+            Lerp(static_cast<float>(currentBarWidths[appName]), static_cast<float>(targetWidth), animationSpeed)
+    );
+}
+
 HWND CreateMainWindow(HINSTANCE hInstance) {
-    // Get screen dimensions
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    int windowWidth = 400;
-    int windowHeight = 300;
 
-    // Calculate window position to center it
     int xPos = (screenWidth - windowWidth) / 2;
     int yPos = (screenHeight - windowHeight) / 2;
 
     HWND hwnd = CreateWindowEx(
-            0,
+            WS_EX_COMPOSITED,  // Adding WS_EX_COMPOSITED for double buffering
             "ScreenTimeTrackerWindowClass",
-            "Screen Time Tracker", // Window title
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, // Removed WS_VSCROLL
+            "Screen Time Tracker",
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
             xPos, yPos, windowWidth, windowHeight,
             NULL,
             NULL,
@@ -122,15 +222,12 @@ Bitmap* ResizeBitmap(Bitmap* source, int width, int height) {
         return nullptr;
     }
 
-    // Create a Graphics object associated with the new bitmap
     Graphics graphics(resized);
 
-    // Set high-quality rendering options
     graphics.SetSmoothingMode(SmoothingModeAntiAlias);
     graphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
     graphics.SetPixelOffsetMode(PixelOffsetModeHighQuality);
 
-    // Draw the original bitmap onto the new bitmap, scaling it
     graphics.DrawImage(source, 0, 0, width, height);
 
     return resized;
@@ -139,7 +236,85 @@ Bitmap* ResizeBitmap(Bitmap* source, int width, int height) {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     static NOTIFYICONDATA nid = {};
     switch (uMsg) {
+        case WM_DRAWITEM: {
+            LPDRAWITEMSTRUCT pDrawItem = (LPDRAWITEMSTRUCT)lParam;
+
+            // Handle the Clear Button
+            if (pDrawItem->CtlID == IDC_CLEAR_BUTTON) {
+                HDC hdc = pDrawItem->hDC;
+                RECT rect = pDrawItem->rcItem;
+
+                HBRUSH hBrush = CreateSolidBrush(RGB(25, 25, 25));
+                FillRect(hdc, &rect, hBrush);
+                DeleteObject(hBrush);
+
+                HPEN hPen = CreatePen(PS_SOLID, 1, RGB(100, 100, 100));
+                SelectObject(hdc, hPen);
+                SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 5, 5);
+                DeleteObject(hPen);
+
+                SetTextColor(hdc, RGB(255, 255, 255));
+                SetBkMode(hdc, TRANSPARENT);
+                DrawText(hdc, "Clear Data", -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                return TRUE;
+            }
+            else if (pDrawItem->CtlID == IDC_BUTTON_TODAY ||
+                     pDrawItem->CtlID == IDC_BUTTON_3DAYS ||
+                     pDrawItem->CtlID == IDC_BUTTON_WEEK ||
+                     pDrawItem->CtlID == IDC_BUTTON_MONTH) {
+
+                HDC hdc = pDrawItem->hDC;
+                RECT rect = pDrawItem->rcItem;
+
+                bool isSelected = false;
+                if ((pDrawItem->CtlID == IDC_BUTTON_TODAY && selectedTimeRange == TODAY) ||
+                    (pDrawItem->CtlID == IDC_BUTTON_3DAYS && selectedTimeRange == LAST_3_DAYS) ||
+                    (pDrawItem->CtlID == IDC_BUTTON_WEEK && selectedTimeRange == LAST_WEEK) ||
+                    (pDrawItem->CtlID == IDC_BUTTON_MONTH && selectedTimeRange == LAST_MONTH)) {
+                    isSelected = true;
+                }
+
+                // Button background color (highlight if selected)
+                HBRUSH hBrush = CreateSolidBrush(isSelected ? RGB(80, 80, 80) : RGB(25, 25, 25)); // Highlight or dark gray
+                FillRect(hdc, &rect, hBrush);
+                DeleteObject(hBrush);
+
+                HPEN hPen = CreatePen(PS_SOLID, 1, isSelected ? RGB(255, 255, 255) : RGB(100, 100, 100));
+                SelectObject(hdc, hPen);
+                SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 5, 5); // Rounded corners
+                DeleteObject(hPen);
+
+                SetTextColor(hdc, RGB(255, 255, 255)); // White text
+                SetBkMode(hdc, TRANSPARENT);
+                if (pDrawItem->CtlID == IDC_BUTTON_TODAY) {
+                    DrawText(hdc, "Today", -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                } else if (pDrawItem->CtlID == IDC_BUTTON_3DAYS) {
+                    DrawText(hdc, "Last 3 Days", -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                } else if (pDrawItem->CtlID == IDC_BUTTON_WEEK) {
+                    DrawText(hdc, "Last Week", -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                } else if (pDrawItem->CtlID == IDC_BUTTON_MONTH) {
+                    DrawText(hdc, "Last Month", -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+                return TRUE;
+            }
+            break;
+        }
+        case WM_TIMER: {
+            if (wParam == 1) {  // Check if this is our timer
+                InvalidateRect(hwnd, NULL, TRUE); // Request the window to repaint
+            }
+            break;
+        }
         case WM_CREATE: {
+            // For debug:
+            // AllocConsole();
+            // freopen("CONOUT$", "w", stdout);
+
+            LoadTrackingDataFromFile("tracking_data.json"); // Load the tracking data from file
+            SetTimer(hwnd, 1, 1000 / 60, NULL);
+
             // Get the DPI scaling factor using GetDeviceCaps
             HDC screen = GetDC(hwnd);
             int dpiX = GetDeviceCaps(screen, LOGPIXELSX);
@@ -149,6 +324,51 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             dpiScaleX = dpiX / 96.0f;
             dpiScaleY = dpiY / 96.0f;
 
+            int headerHeight = static_cast<int>(50 * dpiScaleY);
+            int buttonWidth = static_cast<int>(60 * dpiScaleX);
+            int buttonHeight = static_cast<int>(20 * dpiScaleY);
+            int buttonSpacing = 4;
+
+            HWND hButtonToday = CreateWindow(
+                    "BUTTON", "Today",
+                    WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                    10, 5, buttonWidth, buttonHeight,
+                    hwnd, (HMENU)IDC_BUTTON_TODAY, hInst, NULL
+            );
+            SendMessage(hButtonToday, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+
+            HWND hButton3Days = CreateWindow(
+                    "BUTTON", "Last 3 Days",
+                    WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                    10 + buttonWidth + buttonSpacing, 5, buttonWidth, buttonHeight,
+                    hwnd, (HMENU)IDC_BUTTON_3DAYS, hInst, NULL
+            );
+            SendMessage(hButton3Days, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+
+            HWND hButtonWeek = CreateWindow(
+                    "BUTTON", "Last Week",
+                    WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                    10 + 2 * (buttonWidth + buttonSpacing), 5, buttonWidth, buttonHeight,
+                    hwnd, (HMENU)IDC_BUTTON_WEEK, hInst, NULL
+            );
+            SendMessage(hButtonWeek, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+
+            HWND hButtonMonth = CreateWindow(
+                    "BUTTON", "Last Month",
+                    WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                    10 + 3 * (buttonWidth + buttonSpacing), 5, buttonWidth, buttonHeight,
+                    hwnd, (HMENU)IDC_BUTTON_MONTH, hInst, NULL
+            );
+            SendMessage(hButtonMonth, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+
+            HWND hClearButton = CreateWindow(
+                    "BUTTON", "Clear Data",
+                    WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                    10 + 4 * (buttonWidth + buttonSpacing), 5, buttonWidth, buttonHeight,
+                    hwnd, (HMENU)IDC_CLEAR_BUTTON, hInst, NULL
+            );
+            SendMessage(hClearButton, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+
             // Enable dark mode for the title bar
             BOOL useDarkMode = TRUE;
             DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
@@ -157,19 +377,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             DWM_WINDOW_CORNER_PREFERENCE cornerPreference = DWMWCP_ROUND;
             DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cornerPreference, sizeof(cornerPreference));
 
-            // Initialize scrollbar
             scrollPos = 0;
             scrollMax = 0;
+
+            int contentStartY = headerHeight + static_cast<int>(20 * dpiScaleY);
+            SetWindowPos(hWnd, NULL, 0, contentStartY, windowWidth, windowHeight - contentStartY, SWP_NOZORDER | SWP_NOMOVE);
 
             nid.cbSize = sizeof(NOTIFYICONDATA);
             nid.hWnd = hwnd;
             nid.uID = 1001;
             nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             nid.uCallbackMessage = WM_APP + 1;
-            nid.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APP_ICON)); // Use custom icon
+            nid.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APP_ICON));
             strcpy_s(nid.szTip, "Screen Time Tracker");
             Shell_NotifyIcon(NIM_ADD, &nid);
-            break;
         }
         case WM_CLOSE:
             ShowWindow(hwnd, SW_HIDE);
@@ -180,14 +401,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
 
-            // Calculate scroll bar position
+            // Scroll bar position
             RECT clientRect;
             GetClientRect(hwnd, &clientRect);
             int scrollBarX = clientRect.right - SCROLL_BAR_WIDTH;
             int scrollBarY = 0;
             int scrollBarHeight = clientRect.bottom - clientRect.top;
 
-            // Calculate thumb position
+            // Thumb position
             double proportion = (double)scrollPos / (double)(scrollMax > 0 ? scrollMax : 1);
             int thumbY = static_cast<int>((scrollBarHeight - THUMB_HEIGHT) * proportion);
 
@@ -244,7 +465,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             // Extract the wheel delta
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
 
-            // Determine the scroll amount (number of lines to scroll)
+            // Determine the scroll amount
             int linesToScroll = delta / WHEEL_DELTA; // Typically 1 line per wheel delta
 
             // Adjust scrollPos
@@ -260,6 +481,58 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
             break;
         }
+        case WM_COMMAND: {
+            switch (LOWORD(wParam)) {
+                case IDC_CLEAR_BUTTON: {
+                    {
+                        std::lock_guard<std::mutex> lock(dataMutex);
+
+                        // Clear active time, paths, and start time
+                        appActiveTime.clear();
+                        appPaths.clear();
+                        appStartTime.clear();
+
+                        // Reset tracking for the current app
+                        if (!currentAppName.empty()) {
+                            auto now = std::chrono::system_clock::now();
+                            appStartTime[currentAppName] = now;
+                            appActiveTime[currentAppName] = std::chrono::seconds(0);
+                        }
+
+                        // Debug output to ensure correct reset
+                        std::time_t startTime = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                        std::string startTimeStr = std::ctime(&startTime);
+                        OutputDebugStringA(("Start time after clearing: " + startTimeStr).c_str());
+                    }
+
+                    // Immediately invalidate the window to trigger a repaint with new values
+                    InvalidateRect(hwnd, NULL, TRUE);
+
+                    // Save the cleared data to file
+                    SaveTrackingDataToFile("tracking_data.json");
+                    break;
+                }
+                case IDC_BUTTON_TODAY:
+                    selectedTimeRange = TODAY;
+                    InvalidateRect(hwnd, NULL, TRUE); // Redraw the window
+                    break;
+
+                case IDC_BUTTON_3DAYS:
+                    selectedTimeRange = LAST_3_DAYS;
+                    InvalidateRect(hwnd, NULL, TRUE);
+                    break;
+
+                case IDC_BUTTON_WEEK:
+                    selectedTimeRange = LAST_WEEK;
+                    InvalidateRect(hwnd, NULL, TRUE);
+                    break;
+
+                case IDC_BUTTON_MONTH:
+                    selectedTimeRange = LAST_MONTH;
+                    InvalidateRect(hwnd, NULL, TRUE);
+                    break;
+            }
+        }
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
@@ -267,173 +540,155 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             Bitmap bufferBitmap(ps.rcPaint.right, ps.rcPaint.bottom);
             Graphics bufferGraphics(&bufferBitmap);
 
-            // Set high-quality rendering
             bufferGraphics.SetSmoothingMode(SmoothingModeAntiAlias);
             bufferGraphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
             bufferGraphics.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
             bufferGraphics.SetPixelOffsetMode(PixelOffsetModeHighQuality);
             bufferGraphics.SetCompositingQuality(CompositingQualityHighQuality);
 
-            bufferGraphics.SetPageUnit(UnitPixel);
-            bufferGraphics.ResetTransform();
-
-            // Fill background with black color
-            SolidBrush backgroundBrush(Color(0, 0, 0)); // Black color
+            SolidBrush backgroundBrush(Color(25, 25, 25));
             bufferGraphics.FillRectangle(&backgroundBrush, 0, 0, ps.rcPaint.right, ps.rcPaint.bottom);
 
-            // Use white color for text
-            SolidBrush textBrush(Color(255, 255, 255)); // White text
+            SolidBrush textBrush(Color(255, 255, 255));
 
-            std::lock_guard<std::mutex> lock(dataMutex);
-            for (const auto& entry : appActiveTime) {
-                // Ensure valid data is present
-                assert(entry.second.count() > 0 && "App active time should not be zero");
+            std::lock_guard<std::mutex> lock(dataMutex); // Lock data during painting
+
+            // Get the current time filter based on selected time range
+            auto timeFilter = GetStartTimeForRange(selectedTimeRange);
+
+            // Ensure there is data to display
+            if (appActiveTime.empty()) {
+                std::wstring emptyMessage = L"No application data available.";
+                Font font(L"Segoe UI", static_cast<REAL>(12 * dpiScaleY)); // Adjust font for DPI
+                bufferGraphics.DrawString(emptyMessage.c_str(), -1, &font, PointF(10.0f, 10.0f), &textBrush);
+            } else {
+                std::vector<std::pair<std::string, std::chrono::seconds>> apps(appActiveTime.begin(), appActiveTime.end());
+                std::sort(apps.begin(), apps.end(), [](const auto& a, const auto& b) -> bool {
+                    return a.second > b.second;
+                });
+
+                const int LIST_PADDING = static_cast<int>(20 * dpiScaleY);
+                int contentHeight = 0;
+                int iconSize = static_cast<int>(32 * dpiScaleX);
+                int yIncrement = iconSize + static_cast<int>(15 * dpiScaleY);
+
+                for (const auto& entry : apps) {
+                    if (appStartTime[entry.first] < timeFilter) {
+                        continue;
+                    }
+                    contentHeight += yIncrement;
+                }
+                contentHeight += LIST_PADDING;
+
+                RECT clientRect;
+                GetClientRect(hwnd, &clientRect);
+                int windowHeight = clientRect.bottom - clientRect.top;
+
+                if (contentHeight > windowHeight) {
+                    scrollMax = contentHeight - windowHeight;
+                } else {
+                    scrollMax = 0;
+                }
+
+                int xPos = static_cast<int>(10 * dpiScaleX);
+                int yPos = static_cast<int>(30 * dpiScaleY) - scrollPos;
+
+                std::chrono::seconds totalTime(0);
+                for (const auto& entry : appActiveTime) {
+                    totalTime += entry.second;
+                }
+                if (totalTime.count() == 0) {
+                    totalTime = std::chrono::seconds(1); // Avoid division by zero
+                }
+
+                Font font(L"Segoe UI", static_cast<REAL>(10 * dpiScaleY));
+
+                for (const auto& entry : apps) {
+                    std::string appName = entry.first;
+
+                    if (appStartTime.find(appName) == appStartTime.end() || appStartTime[appName] < timeFilter) {
+                        continue;
+                    }
+
+                    auto appTime = entry.second;
+                    std::string appPath = appPaths[appName];
+
+                    HICON hIconLarge = NULL;
+                    UINT iconCount = ExtractIconExA(appPath.c_str(), 0, &hIconLarge, NULL, 1);
+                    if (iconCount == 0 || !hIconLarge) {
+                        hIconLarge = LoadIcon(NULL, IDI_APPLICATION);
+                    }
+
+                    Bitmap* pIconBitmap = Bitmap::FromHICON(hIconLarge);
+                    Bitmap* pResizedIcon = ResizeBitmap(pIconBitmap, iconSize, iconSize);
+
+                    delete pIconBitmap;
+                    DestroyIcon(hIconLarge);
+
+                    int iconX = xPos;
+                    int iconY = yPos + static_cast<int>(15 * dpiScaleY) - 6;
+                    int textX = xPos + iconSize + static_cast<int>(5 * dpiScaleX);
+                    int appNameY = yPos + static_cast<int>(3 * dpiScaleY) + 5;
+                    int barX = textX;
+                    int barY = yPos + iconSize + static_cast<int>(1 * dpiScaleY) - 5;
+                    int timeY = barY - static_cast<int>(6 * dpiScaleY);
+
+                    if (pResizedIcon) {
+                        bufferGraphics.DrawImage(pResizedIcon, Rect(iconX, iconY, iconSize, iconSize));
+                        delete pResizedIcon;
+                    }
+
+                    std::wstring wAppName(appName.begin(), appName.end());
+                    bufferGraphics.DrawString(wAppName.c_str(), -1, &font, PointF(static_cast<REAL>(textX), static_cast<REAL>(appNameY)), &textBrush);
+
+                    double percentage = static_cast<double>(appTime.count()) / totalTime.count();
+                    int barMaxWidth = std::min(300, static_cast<int>(ps.rcPaint.right - barX - 20 * dpiScaleX));
+                    int targetBarWidth = std::max(static_cast<int>(percentage * barMaxWidth), MIN_BAR_WIDTH); // Ensure the bar has at least MIN_BAR_WIDTH
+                    UpdateBarWidth(appName, targetBarWidth);
+
+                    int animatedBarWidth = currentBarWidths[appName];
+                    Rect barRect(barX, barY, animatedBarWidth, static_cast<int>(8 * dpiScaleY));
+
+                    LinearGradientBrush gradientBrush(
+                            Point(barRect.X, barRect.Y),
+                            Point(barRect.X, barRect.Y + barRect.Height),
+                            LESS_AGGRESSIVE_GRADIENT_START,
+                            LESS_AGGRESSIVE_GRADIENT_END
+                    );
+
+                    DrawRoundedRectangle(bufferGraphics, gradientBrush, barRect, static_cast<int>(3 * dpiScaleX));
+
+                    std::string timeStr = FormatDuration(appTime);
+                    std::wstring wTimeStr(timeStr.begin(), timeStr.end());
+                    bufferGraphics.DrawString(wTimeStr.c_str(), -1, &font, PointF(static_cast<REAL>(barX + animatedBarWidth + static_cast<int>(5 * dpiScaleX)), static_cast<REAL>(timeY)), &textBrush);
+
+                    yPos += yIncrement;
+                }
             }
 
-            // Sort applications by usage time
-            std::vector<std::pair<std::string, std::chrono::seconds>> apps(appActiveTime.begin(), appActiveTime.end());
-            std::sort(apps.begin(), apps.end(), [](const auto& a, const auto& b) -> bool {
-                return a.second > b.second;
-            });
-
-            // Calculate total content height with padding
-            const int LIST_PADDING = static_cast<int>(20 * dpiScaleY); // 20 pixels padding
-            int contentHeight = 0;
-            int iconSize = static_cast<int>(32 * dpiScaleX); // Updated to DESIRED_ICON_SIZE
-            int yIncrement = iconSize + static_cast<int>(15 * dpiScaleY);
-            for (const auto& entry : apps) {
-                contentHeight += yIncrement;
-            }
-            contentHeight += LIST_PADDING; // Add padding after the last item
-
-            // Update scrollbar range
             RECT clientRect;
             GetClientRect(hwnd, &clientRect);
-            int windowHeight = clientRect.bottom - clientRect.top;
-
-            if (contentHeight > windowHeight) {
-                scrollMax = contentHeight - windowHeight;
-            } else {
-                scrollMax = 0;
-            }
-
-            // Adjust starting y based on scroll position
-            int xPos = static_cast<int>(10 * dpiScaleX);
-            int yPos = static_cast<int>(10 * dpiScaleY) - scrollPos;
-
-            std::chrono::seconds totalTime(0);
-            for (const auto& entry : appActiveTime)
-                totalTime += entry.second;
-            if (totalTime.count() == 0)
-                totalTime = std::chrono::seconds(1);
-
-            Font font(L"Segoe UI", static_cast<REAL>(10 * dpiScaleY)); // Adjust for scaling
-
-            for (const auto& entry : apps) {
-                std::string appName = entry.first;
-                auto appTime = entry.second;
-                std::string appPath = appPaths[appName];
-
-                // Check if the icon is already cached
-                Bitmap* pResizedIcon = nullptr;
-
-                // Load the app icon with desired size
-                HICON hIconLarge = NULL;
-                UINT iconCount = ExtractIconExA(appPath.c_str(), 0, &hIconLarge, NULL, 1);
-                if (iconCount == 0 || !hIconLarge) {
-                    hIconLarge = LoadIcon(NULL, IDI_APPLICATION);
-                }
-
-                // Create a GDI+ Bitmap from the HICON
-                Bitmap* pIconBitmap = Bitmap::FromHICON(hIconLarge);
-
-                // Resize the icon bitmap using the helper function
-                pResizedIcon = ResizeBitmap(pIconBitmap, iconSize, iconSize);
-
-                // Clean up
-                delete pIconBitmap;
-                DestroyIcon(hIconLarge);
-
-                // Adjust positions based on scaling
-                int iconX = xPos;
-                int iconY = yPos + static_cast<int>(15 * dpiScaleY) - 6;
-                int textX = xPos + iconSize + static_cast<int>(5 * dpiScaleX);
-                int appNameY = yPos + static_cast<int>(3 * dpiScaleY);
-                int barX = textX;
-                int barY = yPos + iconSize + static_cast<int>(1 * dpiScaleY);
-                int timeY = barY - static_cast<int>(6 * dpiScaleY);
-
-                // Draw the resized icon
-                if (pResizedIcon) {
-                    bufferGraphics.DrawImage(pResizedIcon, Rect(iconX, iconY, iconSize, iconSize));
-                }
-
-                // Draw the app name
-                std::wstring wAppName(appName.begin(), appName.end());
-                bufferGraphics.DrawString(wAppName.c_str(), -1, &font,
-                                          PointF(static_cast<REAL>(textX), static_cast<REAL>(appNameY)), &textBrush);
-
-                // Draw the bar using a gradient brush
-                double percentage = static_cast<double>(appTime.count()) / totalTime.count();
-                int barMaxWidth = ps.rcPaint.right - barX - static_cast<int>(20 * dpiScaleX) - 100;
-                int barWidth = static_cast<int>(percentage * barMaxWidth);
-                Rect barRect(barX, barY, barWidth, static_cast<int>(8 * dpiScaleY)); // BAR_HEIGHT
-
-                // Define gradient colors
-                Color gradientStart(180, 180, 180, 180); // Light gray
-                Color gradientEnd(100, 100, 100, 100);   // Dark gray
-
-                // Create a linear gradient brush
-                LinearGradientBrush gradientBrush(
-                        Point(barRect.X, barRect.Y),
-                        Point(barRect.X, barRect.Y + barRect.Height),
-                        gradientStart,
-                        gradientEnd
-                );
-
-                // Draw the bar using the gradient brush
-                DrawRoundedRectangle(bufferGraphics, gradientBrush, barRect, static_cast<int>(5 * dpiScaleX));
-
-                // Draw the time label aligned with the bar
-                std::string timeStr = FormatDuration(appTime);
-                std::wstring wTimeStr(timeStr.begin(), timeStr.end());
-                bufferGraphics.DrawString(wTimeStr.c_str(), -1, &font,
-                                          PointF(static_cast<REAL>(barX + barWidth + static_cast<int>(5 * dpiScaleX)),
-                                                 static_cast<REAL>(timeY)), &textBrush);
-
-                // Move to the next item
-                yPos += yIncrement;
-            }
-
-            // Draw the custom scroll bar
             int scrollBarX = clientRect.right - SCROLL_BAR_WIDTH;
             int scrollBarY = 0;
             int scrollBarHeight = clientRect.bottom - clientRect.top;
 
-            // Draw scroll bar background
-            SolidBrush scrollBarBgBrush(SCROLL_BAR_BACKGROUND_COLOR);
+            SolidBrush scrollBarBgBrush(DARK_SCROLL_BAR_BACKGROUND_COLOR);
             bufferGraphics.FillRectangle(&scrollBarBgBrush, scrollBarX, scrollBarY, SCROLL_BAR_WIDTH, scrollBarHeight);
 
-            // Calculate thumb position
             double proportion = (double)scrollPos / (double)(scrollMax > 0 ? scrollMax : 1);
             int thumbY = static_cast<int>((scrollBarHeight - THUMB_HEIGHT) * proportion);
-            if (scrollMax == 0) thumbY = 0; // Prevent division by zero
-
-            // Draw scroll bar thumb with gradient
-            Color thumbGradientStart(200, 200, 200, 200); // Lighter gray
-            Color thumbGradientEnd(150, 150, 150, 150);   // Darker gray
+            if (scrollMax == 0) thumbY = 0;
 
             LinearGradientBrush thumbGradientBrush(
                     Point(scrollBarX, thumbY),
                     Point(scrollBarX, thumbY + THUMB_HEIGHT),
-                    thumbGradientStart,
-                    thumbGradientEnd
+                    DARK_SCROLL_BAR_THUMB_COLOR,
+                    LESS_AGGRESSIVE_GRADIENT_END
             );
 
             Rect thumbRect(scrollBarX, thumbY, SCROLL_BAR_WIDTH, THUMB_HEIGHT);
             DrawRoundedRectangle(bufferGraphics, thumbGradientBrush, thumbRect, static_cast<int>(5 * dpiScaleX));
 
-            // Render the off-screen buffer to the window
             Graphics graphics(hdc);
             graphics.DrawImage(&bufferBitmap, 0, 0);
 
@@ -471,10 +726,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 }
             }
             break;
-        case WM_DESTROY:
+        case WM_DESTROY: {
+            KillTimer(hwnd, 1);
+            SaveTrackingDataToFile("tracking_data.json"); // Save the tracking data before exiting
             Shell_NotifyIcon(NIM_DELETE, &nid);
             PostQuitMessage(0);
             break;
+        }
         default:
             return DefWindowProc(hwnd, uMsg, wParam, lParam);
     }

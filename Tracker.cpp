@@ -8,12 +8,13 @@
 #include <string>
 #include <sstream>
 
+extern std::map<std::string, std::chrono::system_clock::time_point> appStartTime;
+
 std::mutex dataMutex;
 std::map<std::string, std::chrono::seconds> appActiveTime;
 std::map<std::string, std::string> appPaths;
 std::string currentAppName = "";
 std::string currentAppPath = "";
-std::chrono::system_clock::time_point appStartTime = std::chrono::system_clock::now();
 extern HWND hWnd;
 extern bool isRunning;
 extern bool isPaused;
@@ -27,23 +28,29 @@ void StartTrackingThread() {
                     auto [appName, appPath] = GetAppNameAndPathFromWindow(hwnd);
                     if (!appName.empty()) {
                         std::lock_guard<std::mutex> lock(dataMutex);
+
+                        // Check if the app changed
                         if (appName != currentAppName) {
+                            // Update the old app's time
                             if (!currentAppName.empty()) {
                                 auto now = std::chrono::system_clock::now();
                                 auto duration = std::chrono::duration_cast<std::chrono::seconds>(
-                                        now - appStartTime);
+                                        now - appStartTime[currentAppName]);
                                 appActiveTime[currentAppName] += duration;
                                 appPaths[currentAppName] = currentAppPath;
                             }
+
+                            // Reset tracking for the new app
                             currentAppName = appName;
                             currentAppPath = appPath;
-                            appStartTime = std::chrono::system_clock::now();
+                            appStartTime[currentAppName] = std::chrono::system_clock::now();
                         } else {
+                            // Update the active time for the current app
                             auto now = std::chrono::system_clock::now();
                             auto duration = std::chrono::duration_cast<std::chrono::seconds>(
-                                    now - appStartTime);
+                                    now - appStartTime[currentAppName]);
                             appActiveTime[currentAppName] += duration;
-                            appStartTime = now;
+                            appStartTime[currentAppName] = now; // Reset the start time to "now"
                         }
                     }
                 }

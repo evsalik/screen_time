@@ -17,7 +17,12 @@ A lightweight Windows application that tracks the active time you spend on diffe
 
 - **Real-Time Tracking**: Monitors active application usage in real-time.
 - **Visual Representation**: Displays usage statistics with application icons, names, and time spent.
-- **Minimalistic UI**: A compact and sleek interface that blends with the Windows environment.
+- **Time Range Filters**: Switch between tracking **Today**, **Last 3 Days**, **Last Week**, or **Last Month** to analyze usage across different time spans.
+- **Animated Usage Bars**: Smooth transitions for application usage bars to show app activity more dynamically.
+- **Minimal Bar Width**: Ensures visibility of all apps even if usage time is very low.
+- **Filter Highlighting**: The selected time range filter button is highlighted for clarity.
+- **Custom Scrollbar**: A sleek scrollbar with a draggable thumb for smooth navigation.
+- **Darker UI Theme**: Updated, darker theme for the usage bars and scrollbar, enhancing the look in dark mode.
 - **System Tray Integration**: Minimizes to the system tray with options to pause, resume, or exit.
 - **DPI Awareness**: Scales appropriately according to system DPI settings.
 - **Dark Mode Support**: Integrates with Windows dark mode for a seamless look.
@@ -33,7 +38,7 @@ A lightweight Windows application that tracks the active time you spend on diffe
 
 ### **Download the Latest Release**
 
-1. **Visit the [Releases](https://github.com/yourusername/screen-time-tracker/releases) page**.
+1. **Visit the [Releases](https://github.com/evsalik/screen_time/releases) page**.
 2. Download the file **`screen-time-tracker-1.0.0.zip`**.
 3. Extract the contents of the ZIP file to a folder of your choice.
 
@@ -57,5 +62,5 @@ Double-click `screen_time_tracker.exe` to start tracking your screen time.
 ### **Clone the Repository**
 
 ```bash
-git clone https://github.com/yourusername/screen-time-tracker.git
-cd screen-time-tracker
+git clone https://github.com/evsalik/screen_time.git
+cd screen_time

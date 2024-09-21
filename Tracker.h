@@ -13,7 +13,6 @@ extern std::map<std::string, std::chrono::seconds> appActiveTime;
 extern std::map<std::string, std::string> appPaths;
 extern std::string currentAppName;
 extern std::string currentAppPath;
-extern std::chrono::system_clock::time_point appStartTime;
 
 std::pair<std::string, std::string> GetAppNameAndPathFromWindow(HWND hwnd);
 void StartTrackingThread();
