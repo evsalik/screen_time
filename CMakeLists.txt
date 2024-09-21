@@ -1,11 +1,9 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.27)
 project(screen_time_tracker)
 
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED True)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(screen_time_tracker
+add_executable(screen_time_tracker WIN32
         main.cpp
         WindowManager.cpp
         Tracker.cpp
@@ -22,3 +20,4 @@ target_link_libraries(screen_time_tracker
         Dwmapi
         Shcore
 )
+
