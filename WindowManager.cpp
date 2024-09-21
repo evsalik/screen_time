@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <thread>
 #include "json.hpp"
 #pragma comment(lib, "Dwmapi.lib")
 #pragma comment(lib, "Shcore.lib")
@@ -102,40 +103,80 @@ std::chrono::system_clock::time_point GetStartTimeForRange(TimeRange range) {
 }
 
 void SaveTrackingDataToFile(const std::string& filename) {
+    std::cout << "Saving data..." << std::endl;
     json j;
     {
         std::lock_guard<std::mutex> lock(dataMutex); // Lock the dataMutex within a scoped block
 
         for (const auto& [appName, timeSpent] : appActiveTime) {
-            j["app_data"][appName]["time_in_seconds"] = timeSpent.count();
-            j["app_data"][appName]["app_path"] = appPaths[appName];
+            // Ensure valid data before saving
+            if (appPaths.find(appName) != appPaths.end() && appStartTime.find(appName) != appStartTime.end()) {
+                j["app_data"][appName]["time_in_seconds"] = timeSpent.count();
+                j["app_data"][appName]["app_path"] = appPaths[appName];
 
-            // Convert the start time to a string
-            std::time_t startTime = std::chrono::system_clock::to_time_t(appStartTime[appName]);
-            j["app_data"][appName]["start_time"] = std::ctime(&startTime);
+                // Convert the start time to a string
+                std::time_t startTime = std::chrono::system_clock::to_time_t(appStartTime[appName]);
+                j["app_data"][appName]["start_time"] = std::ctime(&startTime);
+            }
         }
-    } // Mutex is released here
+    }
 
-    std::ofstream file(filename);
-    if (file.is_open()) {
-        file << j.dump(4);
+    try {
+        std::ofstream file(filename, std::ios::out | std::ios::trunc); // Open in truncate mode
+        if (!file.is_open()) {
+            std::cerr << "Error: Unable to open file for saving data" << std::endl;
+            return;
+        }
+
+        // Dump the JSON with proper indentation
+        file << j.dump(4) << std::endl;  // 4-space indentation and ensuring newline at the end
+
+        // Flush to make sure all content is written
+        file.flush();
+
+        // Close the file after writing
         file.close();
+
+        // Check if file failed to close properly
+        if (file.fail()) {
+            std::cerr << "Error: Failed to close the file properly after saving data" << std::endl;
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "Error saving JSON to file: " << e.what() << std::endl;
     }
 }
 
 void LoadTrackingDataFromFile(const std::string& filename) {
-    std::ifstream file(filename);
+    std::ifstream file(filename, std::ios::in);
     if (!file.is_open()) {
+        std::cerr << "Error: Could not open file for loading data" << std::endl;
         return; // If the file doesn't exist, skip loading
     }
 
     json j;
-    file >> j;
-    file.close();
+    try {
+        file >> j;
+        file.close(); // Ensure the file is closed after reading
+    } catch (const std::exception& e) {
+        // Log the error or handle it if the file is not a valid JSON
+        std::cerr << "Error parsing JSON: " << e.what() << std::endl;
+        file.close();
+        return; // Exit function if the file contains invalid JSON
+    }
+
+    if (j.is_null() || j.empty()) {
+        // Handle empty or null JSON case
+        std::cerr << "Warning: Loaded JSON is empty or null." << std::endl;
+        return; // Don't proceed if the JSON is empty
+    }
 
     std::lock_guard<std::mutex> lock(dataMutex);
 
     for (auto& [appName, data] : j["app_data"].items()) {
+        if (!data.contains("time_in_seconds") || !data.contains("app_path") || !data.contains("start_time")) {
+            continue; // Skip entries with missing data
+        }
+
         std::chrono::seconds timeSpent(data["time_in_seconds"].get<int>());
         appActiveTime[appName] = timeSpent;
         appPaths[appName] = data["app_path"].get<std::string>();
@@ -149,6 +190,7 @@ void LoadTrackingDataFromFile(const std::string& filename) {
         appStartTime[appName] = startTime;
     }
 }
+
 
 void RegisterMainWindowClass(HINSTANCE hInstance) {
     WNDCLASS wc = {};
@@ -235,6 +277,7 @@ Bitmap* ResizeBitmap(Bitmap* source, int width, int height) {
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     static NOTIFYICONDATA nid = {};
+    static std::thread trackingThread;  // Keep a reference to the tracking thread
     switch (uMsg) {
         case WM_DRAWITEM: {
             LPDRAWITEMSTRUCT pDrawItem = (LPDRAWITEMSTRUCT)lParam;
@@ -391,6 +434,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             nid.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APP_ICON));
             strcpy_s(nid.szTip, "Screen Time Tracker");
             Shell_NotifyIcon(NIM_ADD, &nid);
+
+            break;
         }
         case WM_CLOSE:
             ShowWindow(hwnd, SW_HIDE);
@@ -499,6 +544,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                             appActiveTime[currentAppName] = std::chrono::seconds(0);
                         }
 
+                        // Save the cleared data as an empty JSON structure
+                        json j;
+                        std::ofstream file("tracking_data.json");
+                        if (file.is_open()) {
+                            file << j.dump(4); // Save as empty object
+                            file.close();
+                        }
+
                         // Debug output to ensure correct reset
                         std::time_t startTime = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
                         std::string startTimeStr = std::ctime(&startTime);
@@ -508,8 +561,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     // Immediately invalidate the window to trigger a repaint with new values
                     InvalidateRect(hwnd, NULL, TRUE);
 
-                    // Save the cleared data to file
-                    SaveTrackingDataToFile("tracking_data.json");
                     break;
                 }
                 case IDC_BUTTON_TODAY:
@@ -699,7 +750,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             // Not needed for custom scroll bar, but kept for compatibility
             break;
         }
-        case WM_APP + 1:
+        case WM_APP + 1: {
             if (lParam == WM_LBUTTONUP || lParam == WM_RBUTTONUP) {
                 POINT pt;
                 GetCursorPos(&pt);
@@ -709,26 +760,29 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     InsertMenu(hMenu, -1, MF_BYPOSITION, 2, isPaused ? "Resume" : "Pause");
                     InsertMenu(hMenu, -1, MF_BYPOSITION, 3, "Kill");
                     SetForegroundWindow(hwnd);
-                    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY,
-                                             pt.x, pt.y, 0, hwnd, NULL);
+                    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
                     if (cmd == 1) {
-                        if (IsWindowVisible(hwnd))
+                        if (IsWindowVisible(hwnd)) {
                             ShowWindow(hwnd, SW_HIDE);
-                        else
+                        } else {
                             ShowWindow(hwnd, SW_SHOW);
+                        }
                     } else if (cmd == 2) {
                         isPaused = !isPaused;
-                    } else if (cmd == 3) {
+                    } else if (cmd == 3) {  // "Kill" selected
                         isRunning = false;
-                        DestroyWindow(hwnd);
+
+                        SaveTrackingDataToFile("tracking_data.json");
+
+                        PostMessage(hwnd, WM_DESTROY, 0, 0);
                     }
                     DestroyMenu(hMenu);
                 }
             }
             break;
+        }
         case WM_DESTROY: {
-            KillTimer(hwnd, 1);
-            SaveTrackingDataToFile("tracking_data.json"); // Save the tracking data before exiting
+            SaveTrackingDataToFile("tracking_data.json");
             Shell_NotifyIcon(NIM_DELETE, &nid);
             PostQuitMessage(0);
             break;
